@@ -1,0 +1,378 @@
+diff --git a/mech_eap/accept_sec_context.c b/mech_eap/accept_sec_context.c
+index c284e8bcd..4f945c326 100644
+--- a/mech_eap/accept_sec_context.c
++++ b/mech_eap/accept_sec_context.c
+@@ -37,6 +37,8 @@
+ 
+ #include "gssapiP_eap.h"
+ 
++static char *realm = "visited1.org";
++
+ #ifdef GSSEAP_ENABLE_REAUTH
+ static OM_uint32
+ eapGssSmAcceptGssReauth(OM_uint32 *minor,
+@@ -159,6 +161,38 @@ eapGssSmAcceptAcceptorName(OM_uint32 *minor,
+     return GSS_S_CONTINUE_NEEDED;
+ }
+ 
++static OM_uint32
++eapGssSmAcceptErpSupported(OM_uint32 *minor,
++                           gss_cred_id_t cred GSSEAP_UNUSED,
++                           gss_ctx_id_t ctx,
++                           gss_const_name_t target GSSEAP_UNUSED,
++                           gss_OID mech GSSEAP_UNUSED,
++                           OM_uint32 reqFlags GSSEAP_UNUSED,
++                           OM_uint32 timeReq GSSEAP_UNUSED,
++                           gss_channel_bindings_t chanBindings GSSEAP_UNUSED,
++                           gss_buffer_t inputToken GSSEAP_UNUSED,
++                           gss_buffer_t outputToken,
++                           OM_uint32 *smFlags GSSEAP_UNUSED)
++{
++    uint32_t code = 0;
++
++    code = load_uint32_be(inputToken->value);
++    printf("XXXXX> Received ErpSupported subtoken with Code=%d\n", code);
++    if (code == 1){
++        printf("XXXXX> Implicit bootstapping requested. Doing normal EAP\n");
++        outputToken->length = strlen(realm);
++        outputToken->value = strdup(realm);
++        printf("XXXXX> Sending ErpSupported subtoken with Value=%s\n", realm);
++    }
++    else{
++        printf("XXXXX> Implicit bootstapping not requested. Doing ERP\n");
++        ctx->flags |= CTX_FLAG_USE_ERP;
++    }
++
++    *minor = 0;
++    return GSS_S_CONTINUE_NEEDED;
++}
++
+ #ifdef GSSEAP_DEBUG
+ static OM_uint32
+ eapGssSmAcceptVendorInfo(OM_uint32 *minor,
+@@ -213,8 +247,23 @@ eapGssSmAcceptIdentity(OM_uint32 *minor,
+         return GSS_S_DEFECTIVE_TOKEN;
+     }
+ 
+-    reqData = eap_msg_alloc(EAP_VENDOR_IETF, EAP_TYPE_IDENTITY, 0,
+-                            EAP_CODE_REQUEST, 0);
++    if (ctx->flags & CTX_FLAG_USE_ERP){
++        printf("XXXXX> ERP was requested. Sending EAP-Initiate/Re-auth-start with value [%s]\n", realm);
++        reqData = eap_msg_alloc(EAP_VENDOR_IETF, EAP_TYPE_RE_AUTH_START,
++                            1 + 1 + 1 + strlen(realm), /* RESERVED + TYPE + LENGTH + VALUE */
++                            EAP_CODE_INITIATE, 0);
++
++        wpabuf_put_u8(reqData, 0); // RESERVED
++        wpabuf_put_u8(reqData, 4); // TYPE = domain name (4)
++        wpabuf_put_u8(reqData, strlen(realm)); // LENGTH = strlen(realm)
++        wpabuf_put_data(reqData, realm, strlen(realm)); // VALUE = realm
++    }
++
++    else{
++        reqData = eap_msg_alloc(EAP_VENDOR_IETF, EAP_TYPE_IDENTITY, 0,
++                             EAP_CODE_REQUEST, 0);
++    }
++
+     if (reqData == NULL) {
+         *minor = ENOMEM;
+         return GSS_S_FAILURE;
+@@ -246,10 +295,13 @@ isIdentityResponseP(gss_buffer_t inputToken)
+     struct wpabuf respData;
+ 
+     wpabuf_set(&respData, inputToken->value, inputToken->length);
++    printf("XXXXX> TYPE: %d\n", eap_get_type(&respData));
+ 
+-    return (eap_get_type(&respData) == EAP_TYPE_IDENTITY);
++    return ( (eap_get_type(&respData) == EAP_TYPE_IDENTITY && eap_get_code(&respData) == EAP_CODE_RESPONSE) ||
++             (eap_get_type(&respData) == EAP_TYPE_RE_AUTH && eap_get_code(&respData) == EAP_CODE_INITIATE) );
+ }
+ 
++
+ /*
+  * Save the asserted initiator identity from the EAP identity response.
+  */
+@@ -266,8 +318,15 @@ importInitiatorIdentity(OM_uint32 *minor,
+ 
+     wpabuf_set(&respData, inputToken->value, inputToken->length);
+ 
+-    pos = eap_hdr_validate(EAP_VENDOR_IETF, EAP_TYPE_IDENTITY,
+-                           &respData, &len);
++    if (eap_get_type(&respData) == EAP_TYPE_IDENTITY && eap_get_code(&respData) == EAP_CODE_RESPONSE){
++        pos = eap_hdr_validate(EAP_VENDOR_IETF, EAP_TYPE_IDENTITY, &respData, &len);
++    }
++    else {
++        pos = eap_hdr_validate(EAP_VENDOR_IETF, EAP_TYPE_RE_AUTH, &respData, &len);
++        len = pos[4]; // read TLV lentgth
++        pos += 5; // position the cursor that he keynameNAI
++    }
++    
+     if (pos == NULL) {
+         *minor = GSSEAP_PEER_BAD_MESSAGE;
+         return GSS_S_DEFECTIVE_TOKEN;
+@@ -282,6 +341,7 @@ importInitiatorIdentity(OM_uint32 *minor,
+                             ctx->mechanismUsed, &ctx->initiatorName);
+ }
+ 
++
+ /*
+  * Pass the asserted initiator identity to the authentication server.
+  */
+@@ -510,6 +570,8 @@ eapGssSmAcceptAuthenticate(OM_uint32 *minor,
+     struct rs_packet *req = NULL, *resp = NULL;
+     int isAccessChallenge;
+ 
++
++
+     if (ctx->acceptorCtx.radContext == NULL) {
+         /* May be NULL from an imported partial context */
+         major = createRadiusHandle(minor, cred, ctx);
+@@ -518,10 +580,14 @@ eapGssSmAcceptAuthenticate(OM_uint32 *minor,
+     }
+ 
+     if (isIdentityResponseP(inputToken)) {
++        printf("XXXXX> isIdentityResponseP = TRUE\n");
+         major = importInitiatorIdentity(minor, ctx, inputToken);
+         if (GSS_ERROR(major))
+             return major;
+     }
++    else{
++        printf("XXXXX> NO ID\n");
++    }
+ 
+     rconn = ctx->acceptorCtx.radConn;
+ 
+@@ -824,6 +890,13 @@ static struct gss_eap_sm eapGssAcceptorSm[] = {
+         0,
+         eapGssSmAcceptAcceptorName
+     },
++    {
++        ITOK_TYPE_ERP_SUPPORTED_REQ,
++        ITOK_TYPE_ERP_SUPPORTED_RESP,
++        GSSEAP_STATE_INITIAL,
++        0,
++        eapGssSmAcceptErpSupported
++    },    
+ #ifdef GSSEAP_DEBUG
+     {
+         ITOK_TYPE_VENDOR_INFO,
+diff --git a/mech_eap/gssapiP_eap.h b/mech_eap/gssapiP_eap.h
+index 5c5c1a9ab..175c2496e 100644
+--- a/mech_eap/gssapiP_eap.h
++++ b/mech_eap/gssapiP_eap.h
+@@ -173,6 +173,8 @@ struct gss_cred_id_struct
+ #define CTX_FLAG_KRB_REAUTH                 0x00000002
+ #define CTX_FLAG_CHANNEL_BINDINGS_VERIFIED  0x00000004
+ 
++#define CTX_FLAG_USE_ERP                    0x00000008
++
+ #define CTX_IS_INITIATOR(ctx)               (((ctx)->flags & CTX_FLAG_INITIATOR) != 0)
+ 
+ #define CTX_IS_ESTABLISHED(ctx)             ((ctx)->state == GSSEAP_STATE_ESTABLISHED)
+@@ -188,6 +190,7 @@ struct gss_cred_id_struct
+ #define CTX_FLAG_EAP_ALT_ACCEPT             0x00800000
+ #define CTX_FLAG_EAP_ALT_REJECT             0x01000000
+ #define CTX_FLAG_EAP_CHBIND_ACCEPT          0x02000000
++#define CTX_FLAG_ERP_IMPLICIT_BOOTSTRAP     0x04000000
+ #define CTX_FLAG_EAP_MASK                   0xFFFF0000
+ 
+ #define CONFIG_BLOB_CLIENT_CERT             0
+diff --git a/mech_eap/init_sec_context.c b/mech_eap/init_sec_context.c
+index 9c62f5a65..9413effe2 100644
+--- a/mech_eap/init_sec_context.c
++++ b/mech_eap/init_sec_context.c
+@@ -78,6 +78,9 @@ policyVariableToFlag(enum eapol_bool_var variable)
+     case EAPOL_altReject:
+         flag = CTX_FLAG_EAP_ALT_REJECT;
+         break;
++    case EAPOL_implicitBootstrap:
++        flag = CTX_FLAG_ERP_IMPLICIT_BOOTSTRAP;
++        break;
+     }
+ 
+     return flag;
+@@ -370,6 +373,9 @@ peerConfigInit(OM_uint32 *minor, gss_ctx_id_t ctx)
+     eapPeerConfig->anonymous_identity_len = 0;
+     eapPeerConfig->password = NULL;
+     eapPeerConfig->password_len = 0;
++    eapPeerConfig->erpSupported = 1;
++    eapPeerConfig->homeRealm = strdup("sec.cs.kent.ac.uk");
++
+     eapPeerConfig->eap_methods = (struct eap_method_type *) allowed_eap_method_types;
+ 
+     GSSEAP_ASSERT(cred != GSS_C_NO_CREDENTIAL);
+@@ -821,8 +827,53 @@ eapGssSmInitAcceptorName(OM_uint32 *minor,
+     return GSS_S_CONTINUE_NEEDED;
+ }
+ 
++
+ static OM_uint32
+-eapGssSmInitIdentity(OM_uint32 *minor,
++eapGssSmInitErpSupported(OM_uint32 *minor,
++                         gss_cred_id_t cred GSSEAP_UNUSED,
++                         gss_ctx_id_t ctx,
++                         gss_const_name_t target GSSEAP_UNUSED,
++                         gss_OID mech GSSEAP_UNUSED,
++                         OM_uint32 reqFlags GSSEAP_UNUSED,
++                         OM_uint32 timeReq GSSEAP_UNUSED,
++                         gss_channel_bindings_t chanBindings GSSEAP_UNUSED,
++                         gss_buffer_t inputToken GSSEAP_UNUSED,
++                         gss_buffer_t outputToken,
++                         OM_uint32 *smFlags GSSEAP_UNUSED)
++{
++    if (GSSEAP_SM_STATE(ctx) == GSSEAP_STATE_INITIAL) {
++        int32_t code = 0;
++        
++        if (ctx->flags & CTX_FLAG_ERP_IMPLICIT_BOOTSTRAP){
++            printf("XXXXX> Requesting implicit bootstrapping\n");
++            code = 1;
++        }
++        else{
++            printf("XXXXX> Requesting ERP.\n");
++            code = 2;
++        }
++
++        outputToken->length = 4;
++        outputToken->value = malloc(4);
++        store_uint32_be(code, outputToken->value);
++        printf("XXXXX> Sending ErpSupported subtoken with Code=%d\n", code);
++        return GSS_S_CONTINUE_NEEDED;
++    } else {
++        struct eap_peer_config *eapPeerConfig = &ctx->initiatorCtx.eapPeerConfig;
++        char realm[256];
++        memcpy(realm, inputToken->value, inputToken->length);
++        realm[inputToken->length] = 0;
++        printf("XXXXX> Received ErpSupported subtoken with Value=%s\n", realm);
++        eapPeerConfig->acceptorRealm = strdup(realm);
++        return GSS_S_CONTINUE_NEEDED;
++    }
++
++    *minor = 0;
++    return GSS_S_CONTINUE_NEEDED;
++}
++
++static OM_uint32
++eapGssSmInitEap(OM_uint32 *minor,
+                      gss_cred_id_t cred GSSEAP_UNUSED,
+                      gss_ctx_id_t ctx,
+                      gss_const_name_t target GSSEAP_UNUSED,
+@@ -836,22 +887,8 @@ eapGssSmInitIdentity(OM_uint32 *minor,
+ {
+     struct eap_config eapConfig;
+ 
+-#ifdef GSSEAP_ENABLE_REAUTH
+-    if (GSSEAP_SM_STATE(ctx) == GSSEAP_STATE_REAUTHENTICATE) {
+-        OM_uint32 tmpMinor;
+-
+-        /* server didn't support reauthentication, sent EAP request */
+-        gssDeleteSecContext(&tmpMinor, &ctx->reauthCtx, GSS_C_NO_BUFFER);
+-        ctx->flags &= ~(CTX_FLAG_KRB_REAUTH);
+-        GSSEAP_SM_TRANSITION(ctx, GSSEAP_STATE_INITIAL);
+-    } else
+-#endif
+-        *smFlags |= SM_FLAG_FORCE_SEND_TOKEN;
+-
+-    GSSEAP_ASSERT((ctx->flags & CTX_FLAG_KRB_REAUTH) == 0);
+-    GSSEAP_ASSERT(inputToken == GSS_C_NO_BUFFER);
+-
+     memset(&eapConfig, 0, sizeof(eapConfig));
++    *smFlags |= SM_FLAG_FORCE_SEND_TOKEN;
+ 
+     ctx->initiatorCtx.eap = eap_peer_sm_init(ctx,
+                                              &gssEapPolicyCallbacks,
+@@ -870,6 +907,45 @@ eapGssSmInitIdentity(OM_uint32 *minor,
+         return GSS_S_FAILURE;
+     }
+ 
++    /* poke EAP state machine to IDLE STATE */
++    if (eap_peer_sm_step(ctx->initiatorCtx.eap) != 1) {
++        *minor = GSSEAP_PEER_SM_STEP_FAILURE;
++        return GSS_S_FAILURE;
++    }
++
++    *minor = 0;
++
++    return GSS_S_CONTINUE_NEEDED;
++}
++
++static OM_uint32
++eapGssSmInitIdentity(OM_uint32 *minor,
++                     gss_cred_id_t cred GSSEAP_UNUSED,
++                     gss_ctx_id_t ctx,
++                     gss_const_name_t target GSSEAP_UNUSED,
++                     gss_OID mech GSSEAP_UNUSED,
++                     OM_uint32 reqFlags GSSEAP_UNUSED,
++                     OM_uint32 timeReq GSSEAP_UNUSED,
++                     gss_channel_bindings_t chanBindings GSSEAP_UNUSED,
++                     gss_buffer_t inputToken GSSEAP_UNUSED,
++                     gss_buffer_t outputToken GSSEAP_UNUSED,
++                     OM_uint32 *smFlags)
++{
++#ifdef GSSEAP_ENABLE_REAUTH
++    if (GSSEAP_SM_STATE(ctx) == GSSEAP_STATE_REAUTHENTICATE) {
++        OM_uint32 tmpMinor;
++
++        /* server didn't support reauthentication, sent EAP request */
++        gssDeleteSecContext(&tmpMinor, &ctx->reauthCtx, GSS_C_NO_BUFFER);
++        ctx->flags &= ~(CTX_FLAG_KRB_REAUTH);
++        GSSEAP_SM_TRANSITION(ctx, GSSEAP_STATE_INITIAL);
++    } else
++#endif
++        *smFlags |= SM_FLAG_FORCE_SEND_TOKEN;
++
++    GSSEAP_ASSERT((ctx->flags & CTX_FLAG_KRB_REAUTH) == 0);
++    GSSEAP_ASSERT(inputToken == GSS_C_NO_BUFFER);
++
+     GSSEAP_SM_TRANSITION_NEXT(ctx);
+ 
+     *minor = 0;
+@@ -877,6 +953,8 @@ eapGssSmInitIdentity(OM_uint32 *minor,
+     return GSS_S_CONTINUE_NEEDED;
+ }
+ 
++
++
+ static OM_uint32
+ eapGssSmInitAuthenticate(OM_uint32 *minor,
+                          gss_cred_id_t cred GSSEAP_UNUSED,
+@@ -1124,6 +1202,13 @@ eapGssSmInitAcceptorMIC(OM_uint32 *minor,
+ }
+ 
+ static struct gss_eap_sm eapGssInitiatorSm[] = {
++    {
++        ITOK_TYPE_NONE,
++        ITOK_TYPE_NONE,
++        GSSEAP_STATE_INITIAL,
++        SM_ITOK_FLAG_REQUIRED,
++        eapGssSmInitEap
++    },
+     {
+         ITOK_TYPE_CONTEXT_ERR,
+         ITOK_TYPE_NONE,
+@@ -1139,6 +1224,13 @@ static struct gss_eap_sm eapGssInitiatorSm[] = {
+         0,
+         eapGssSmInitAcceptorName
+     },
++    {
++        ITOK_TYPE_ERP_SUPPORTED_RESP,
++        ITOK_TYPE_ERP_SUPPORTED_REQ,
++        GSSEAP_STATE_INITIAL | GSSEAP_STATE_AUTHENTICATE,
++        0,
++        eapGssSmInitErpSupported
++    },    
+ #ifdef GSSEAP_DEBUG
+     {
+         ITOK_TYPE_NONE,
+diff --git a/mech_eap/util.h b/mech_eap/util.h
+index 7734a553f..1472b264d 100644
+--- a/mech_eap/util.h
++++ b/mech_eap/util.h
+@@ -209,6 +209,9 @@ gssEapEncodeGssChannelBindings(OM_uint32 *minor,
+ #define ITOK_TYPE_INITIATOR_MIC         0x0000000D /* critical, required, if not reauth */
+ #define ITOK_TYPE_ACCEPTOR_MIC          0x0000000E /* TBD */
+ 
++#define ITOK_TYPE_ERP_SUPPORTED_REQ     0x0000000F /* optional */
++#define ITOK_TYPE_ERP_SUPPORTED_RESP    0x00000010 /* optional */
++
+ #define ITOK_FLAG_CRITICAL              0x80000000  /* critical, wire flag */
+ #define ITOK_FLAG_VERIFIED              0x40000000  /* verified, API flag */
+ 

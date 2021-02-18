@@ -1,0 +1,11 @@
+version: '3'
+services:
+  erp_client:
+    build:
+      context: erp_client
+  visited_radius:
+    build:
+      context: visited_radius
+  home_radius:
+    build:
+      context: home_radius
