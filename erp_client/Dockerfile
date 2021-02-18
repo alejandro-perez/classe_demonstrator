@@ -11,14 +11,11 @@ RUN wget https://repository.project-moonshot.org/debian-moonshot/moonshot-reposi
     && apt-get -y update && apt-get -y install moonshot-ui-dev libradsec-dev moonshot-ui
 # clone the mech_eap for what the patch was meant to
 RUN git clone https://github.com/janetuk/mech_eap.git --branch v0.9.5
-# download the libeap patch and apply it
+# copy the patch files apply them
 WORKDIR mech_eap
-RUN wget https://www.um.es/classe/files/libeap.patch \
-    && patch -p2 -i libeap.patch
-# apply the mech_eap patch. The one from the webpage does not work with this version of mech_eap, so this is a slightly
-# modified version
-COPY mech_eap.patch .
-RUN patch -p1 -i mech_eap.patch
+COPY libeap.patch mech_eap.patch ./
+RUN patch -p2 -i libeap.patch \
+    && patch -p1 -i mech_eap.patch
 # build mech_eap and install it
 RUN autoreconf -fi \
     && ./configure --without-shibresolver --without-opensaml \

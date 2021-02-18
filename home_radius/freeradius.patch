@@ -1,0 +1,698 @@
+diff -r ede8120028a7 freeradius-server-3.0.3/src/modules/rlm_eap/eap.c
+--- a/freeradius-server-3.0.3/src/modules/rlm_eap/eap.c	Mon Nov 03 11:30:49 2014 +0100
++++ b/freeradius-server-3.0.3/src/modules/rlm_eap/eap.c	Sat Mar 07 08:47:32 2015 +0100
+@@ -66,7 +66,9 @@
+ 	"request",
+ 	"response",
+ 	"success",
+-	"failure"
++	"failure",
++    "initiate",
++    "finish",
+ };
+ 
+ static int eap_module_free(void *ctx)
+@@ -341,6 +343,138 @@
+ 
+ 	return method;
+ }
++#include <openssl/hmac.h>
++#define SHA256_MAC_LEN 32
++
++uint8_t* prfplus(const uint8_t *key, size_t key_len, const uint8_t *seed,
++            size_t seed_len, size_t buf_len)
++{      
++    char i, iterations = buf_len / SHA256_MAC_LEN + 1;
++    uint8_t* buf = malloc(SHA256_MAC_LEN * iterations);
++    uint8_t tmp[SHA256_MAC_LEN + seed_len + 1], *pos = buf;
++    int tmpLen = 0;
++
++    /* first iteration */
++    memcpy(tmp, seed, seed_len);
++    tmp[seed_len] =  1;
++    tmpLen = seed_len + 1;
++    HMAC(EVP_sha256(), key, key_len, tmp, tmpLen, pos, NULL);
++    pos += SHA256_MAC_LEN;
++    
++    for (i = 2; i <= iterations; i++){
++        memcpy(tmp, pos - SHA256_MAC_LEN, SHA256_MAC_LEN);
++        memcpy(tmp + SHA256_MAC_LEN, seed, seed_len);
++        tmp[SHA256_MAC_LEN + seed_len] =  i;
++        tmpLen = SHA256_MAC_LEN + seed_len + 1;
++        HMAC(EVP_sha256(), key, key_len, tmp, tmpLen, pos, NULL);
++        pos += SHA256_MAC_LEN;
++    }
++    return buf;
++}
++
++
++
++eap_rcode_t erp_execute(rlm_eap_t *inst, eap_handler_t *handler){
++    int i = 0;
++    dump_erp_keys(inst);
++    printf("XXXXX> Looking EMSK for keynameNAI %s\n", handler->identity);
++    uint8_t* emsk = get_erp_key(inst, handler->identity);
++
++
++    uint8_t buffer[512];
++    if (emsk){
++        int len = fr_bin2hex(buffer, emsk, 10);
++        printf("XXXX> EMSK found: %s...\n", buffer);
++
++        // derive keys rRK and rIK SEQ=0 hardcoded
++        char rRKlabel[] = "ERP Re-authentication Root Key@ietf.org\x0\x0\x40";
++        /* cryptosuite is fixed to 2 = HMAC-SHA256-128 */
++        char rIKlabel[] = "Re-authentication Integrity Key@ietf.org\x0\x02\x0\x40";
++        /* TODO SEQ is fixed to \x0\x0 */
++        char rMSKlabel[] = "Re-authentication Master Session Key@ietf.org\x0\x0\x0\x0\x40";
++
++        uint8_t* rRK = prfplus(emsk, 64, rRKlabel, sizeof(rRKlabel) - 1, 64);
++        uint8_t* rIK = prfplus(rRK, 64, rIKlabel, sizeof(rIKlabel) - 1, 64);
++        uint8_t* rMSK = prfplus(rRK, 64, rMSKlabel, sizeof(rMSKlabel) - 1, 64);
++        len = fr_bin2hex(buffer, rRK, 10);
++        printf("XXXX> rRK derived: %s...\n", buffer);
++        len = fr_bin2hex(buffer, rIK, 10);
++        printf("XXXX> rIK derived: %s...\n", buffer);
++        len = fr_bin2hex(buffer, rMSK, 10);
++        printf("XXXX> rMSK derived: %s...\n", buffer);
++
++        // Verify client's packet 
++        if (handler->eap_ds->response->length < 16){
++            printf("XXX> ERP packet too small\n");
++            return EAP_INVALID; // EAP_OK
++        }
++
++        HMAC(EVP_sha256(), rIK, 64, handler->eap_ds->response->packet, handler->eap_ds->response->length - 16, buffer, NULL);
++        if (memcmp(handler->eap_ds->response->packet + handler->eap_ds->response->length - 16, buffer, 16)){
++            printf("XXX> Invalid AUTH TAG received!!");
++            return EAP_INVALID; // EAP_OK            
++        }             
++        printf("XXX> AUTH TAG verified successfully.\n");
++
++        // Check for DSRK request
++        DICT_ATTR *da = dict_attrbyname("DSRK-Req");
++        VALUE_PAIR	*dsrk_req = pairfind(handler->request->packet->vps, da->attr, da->vendor, TAG_ANY);
++        // Generate response (NEED TO GENRATE IT PROPERLY)
++        // FLAGS + SEQ + TLV_TYPE + TLV_LENGTH + TLV_VALUE + TLV_TYPE + TLV_LENGTH + TLV_VALUE + CRYPTOSUITE + AUTHENTICATION TAG
++        uint8_t packetlen = 1 + 2 + 1 + 1 + strlen(handler->identity) + 1 + 16;
++        if (dsrk_req)
++            packetlen += 1 + 1 + dsrk_req->length;
++        
++        handler->eap_ds->request->code = PW_EAP_FINISH;
++        handler->eap_ds->request->type.num = 2;
++        handler->eap_ds->request->type.length = packetlen;        
++        uint8_t *pos = handler->eap_ds->request->type.data = talloc_array(handler->eap_ds->request, uint8_t, packetlen);
++        *pos++ = 0x00; // FLAGS
++        *pos++ = 0x00; // SEQ[1]
++        *pos++ = 0x00; // SEQ[0]
++        *pos++ = 1; // TLV type
++        *pos++ = strlen(handler->identity); // TLV LEN        
++        memcpy(pos, handler->identity, strlen(handler->identity)); // keynameNAI
++        pos += strlen(handler->identity);
++
++        if (dsrk_req){
++            *pos++ = 4; // TLV type
++            *pos++ = dsrk_req->length; // TLV LEN        
++            memcpy(pos, dsrk_req->vp_octets, dsrk_req->length); // keynameNAI
++            pos += dsrk_req->length;
++        }
++        
++        *pos++ = 2;  // CRYPTOSUITE
++
++        eap_wireformat(handler->eap_ds->request);
++        len = EAP_HEADER_LEN + 1 + packetlen;
++        printf("LEN %d\n", len);
++        HMAC(EVP_sha256(), rIK, 64, handler->eap_ds->request->packet, len - 16, buffer, NULL);
++        memcpy(handler->eap_ds->request->packet + len - 16, buffer, 16);
++        
++        
++/*    
++    // AUTHENTICATION TAG (generated with rIK)
++    hmac_sha256(sm->rIK, sm->keyLen, wpabuf_head(resp), wpabuf_len(resp), tmp);
++    for (i=0; i<16; i++)        
++        wpabuf_put_u8(resp, tmp[i]);
++*/
++        // derive rMSK
++        eap_add_reply(handler->request, "MS-MPPE-Recv-Key", rMSK, 32);
++        eap_add_reply(handler->request, "MS-MPPE-Send-Key", rMSK + 32, 32);
++        eap_add_reply(handler->request, "EAP-EMSK", emsk, 64);
++
++        return EAP_OK;
++    }
++    else {
++        printf("UMU> EMSK not found. Failed doing ERP\n");        
++        handler->eap_ds->request->code = PW_EAP_FAILURE;
++        return EAP_INVALID; // EAP_OK
++    }
++}
++
++
++
+ 
+ /** Select the correct callback based on a response
+  *
+@@ -361,6 +495,13 @@
+ 	eap_type_t		next = inst->default_method;
+ 	VALUE_PAIR		*vp;
+ 
++    /* UMU do ERP */
++    printf("UMU> ERP packet code %d\n", handler->eap_ds->response->code);
++    if (handler->eap_ds->response->code == PW_EAP_INITIATE){
++        return erp_execute(inst, handler);
++    }
++    
++
+ 	/*
+ 	 *	Don't trust anyone.
+ 	 */
+@@ -448,37 +589,37 @@
+ 		goto do_initiate;
+ 		break;
+ 
+-		/*
+-		 *	Key off of the configured sub-modules.
+-		 */
+-		default:
+-			RDEBUG2("EAP %s (%d)",
+-				eap_type2name(type->num),
+-				type->num);
++    /*
++     *	Key off of the configured sub-modules.
++     */
++    default:
++        RDEBUG2("EAP %s (%d)",
++            eap_type2name(type->num),
++            type->num);
+ 
+-			/*
+-			 *	We haven't configured it, it doesn't exit.
+-			 */
+-			if (!inst->methods[type->num]) {
+-				REDEBUG2("Client asked for unsupported "
+-					 "type %s (%d)",
+-					 eap_type2name(type->num),
+-					 type->num);
++        /*
++         *	We haven't configured it, it doesn't exit.
++         */
++        if (!inst->methods[type->num]) {
++            REDEBUG2("Client asked for unsupported "
++                 "type %s (%d)",
++                 eap_type2name(type->num),
++                 type->num);
+ 
+-				return EAP_INVALID;
+-			}
++            return EAP_INVALID;
++        }
+ 
+-			rad_assert(handler->stage == AUTHENTICATE);
+-			handler->type = type->num;
+-			if (eap_module_call(inst->methods[type->num],
+-					    handler) == 0) {
+-				REDEBUG2("Failed continuing EAP %s (%d) session. "
+-					 "EAP sub-module failed",
+-					 eap_type2name(type->num),
+-					 type->num);
++        rad_assert(handler->stage == AUTHENTICATE);
++        handler->type = type->num;
++        if (eap_module_call(inst->methods[type->num],
++                    handler) == 0) {
++            REDEBUG2("Failed continuing EAP %s (%d) session. "
++                 "EAP sub-module failed",
++                 eap_type2name(type->num),
++                 type->num);
+ 
+-				return EAP_INVALID;
+-			}
++            return EAP_INVALID;
++        }
+ 		break;
+ 	}
+ 
+@@ -548,6 +689,7 @@
+ 			 */
+ 		case PW_EAP_SUCCESS:
+ 		case PW_EAP_FAILURE:
++        case PW_EAP_FINISH:
+ 			break;
+ 
+ 			/*
+@@ -582,6 +724,7 @@
+ 	if (eap_wireformat(reply) == EAP_INVALID) {
+ 		return RLM_MODULE_INVALID;
+ 	}
++
+ 	eap_packet = (eap_packet_raw_t *)reply->packet;
+ 
+ 	vp = radius_paircreate(request->reply, &request->reply->vps, PW_EAP_MESSAGE, 0);
+@@ -614,6 +757,7 @@
+ 		rcode = RLM_MODULE_HANDLED; /* leap weirdness */
+ 		break;
+ 	case PW_EAP_SUCCESS:
++    case PW_EAP_FINISH:
+ 		request->reply->code = PW_CODE_AUTHENTICATION_ACK;
+ 		rcode = RLM_MODULE_OK;
+ 		break;
+@@ -642,7 +786,6 @@
+ 		rcode = RLM_MODULE_REJECT;
+ 		break;
+ 	}
+-
+ 	return rcode;
+ }
+ 
+@@ -789,6 +932,11 @@
+ 		       eap_msg->length);
+ 	}
+ 
++	if (eap_msg->vp_octets[0] == PW_EAP_INITIATE) {
++		printf("UMU> EAP-start ERP \n");
++		return EAP_OK;
++	}
++
+ 	/*
+ 	 *	We handle request and responses.  The only other defined
+ 	 *	codes are success and fail.  The client SHOULD NOT be
+@@ -928,7 +1076,9 @@
+ 	 */
+ 	if ((len <= EAP_HEADER_LEN) ||
+ 	    ((eap_packet->code != PW_EAP_RESPONSE) &&
+-	     (eap_packet->code != PW_EAP_REQUEST)) ||
++	     (eap_packet->code != PW_EAP_REQUEST) &&
++         (eap_packet->code != PW_EAP_INITIATE) &&
++         (eap_packet->code != PW_EAP_FINISH)) ||
+ 	    (eap_packet->data[0] <= 0) ||
+ 	    (eap_packet->data[0] >= PW_EAP_MAX_TYPES)) {
+ 
+@@ -937,7 +1087,7 @@
+ 	}
+ 
+ 	/* we don't expect notification, but we send it */
+-	if (eap_packet->data[0] == PW_EAP_NOTIFICATION) {
++	if (eap_packet->code == PW_EAP_REQUEST && eap_packet->data[0] == PW_EAP_NOTIFICATION) {
+ 		RAUTH("Got NOTIFICATION, "
+ 			       "Ignoring the packet");
+ 		return EAP_INVALID;
+@@ -948,6 +1098,39 @@
+ 
+ 
+ /*
++ *  Get the user Identity only from EAP-Initiate/Re-auth packets
++ */
++static char *erp_identity(REQUEST *request, eap_handler_t *handler, eap_packet_raw_t *eap_packet)
++{
++	int size;
++	uint16_t len;
++	char *identity;
++
++	if ((!eap_packet) ||
++	    (eap_packet->code != PW_EAP_INITIATE) ||
++	    (eap_packet->data[0] != 2)) { // RE-AUTH
++		return NULL;
++	}
++
++	memcpy(&len, eap_packet->length, sizeof(uint16_t));
++	len = ntohs(len);
++
++	if ((len <= 11) || (eap_packet->data[4] != 0x01)) { // KeyNAME TLV
++		RDEBUG("UserIdentity Unknown ");
++		return NULL;
++	}
++
++	size = eap_packet->data[5];
++	identity = talloc_array(handler, char, size + 1);
++	memcpy(identity, &eap_packet->data[6], size);
++	identity[size] = '\0';
++
++    printf("UMU> ******* %s\n", identity);
++
++	return identity;
++}
++
++/*
+  *  Get the user Identity only from EAP-Identity packets
+  */
+ static char *eap_identity(REQUEST *request, eap_handler_t *handler, eap_packet_raw_t *eap_packet)
+@@ -1062,7 +1245,8 @@
+ 	 *	eap_handler_t MUST be found in the list if it is not
+ 	 *	EAP-Identity response
+ 	 */
+-	if (eap_packet->data[0] != PW_EAP_IDENTITY) {
++	if (eap_packet->code == PW_EAP_RESPONSE && eap_packet->data[0] != PW_EAP_IDENTITY) {
++        printf("UMU> NO IDENTITY \n");
+ 		handler = eaplist_find(inst, request, eap_packet);
+ 		if (!handler) {
+ 			/* Either send EAP_Identity or EAP-Fail */
+@@ -1118,7 +1302,7 @@
+ 			       goto error;
+ 		       }
+ 	       }
+-	} else {		/* packet was EAP identity */
++	} else if (eap_packet->code == PW_EAP_RESPONSE) {		/* packet was EAP identity */
+ 		handler = eap_handler_alloc(inst);
+ 		if (!handler) {
+ 			goto error;
+@@ -1162,6 +1346,50 @@
+ 			       goto error2;
+ 		       }
+ 	       }
++	} else if (eap_packet->code == PW_EAP_INITIATE) {		/* packet was ERP initiate */
++		handler = eap_handler_alloc(inst);
++		if (!handler) {
++			goto error;
++		}
++
++		/*
++		 *	All fields in the handler are set to zero.
++		 */
++
++		handler->identity = erp_identity(request, handler, eap_packet);
++
++		if (!handler->identity) {
++			RDEBUG("Identity Unknown, authentication failed");
++            goto error2;
++		}
++
++       vp = pairfind(request->packet->vps, PW_USER_NAME, 0, TAG_ANY);
++       if (!vp) {
++           /*
++        *	NAS did not set the User-Name
++        *	attribute, so we set it here and
++        *	prepend it to the beginning of the
++        *	request vps so that autz's work
++        *	correctly
++        */
++           RWDEBUG2("NAS did not set User-Name.  Setting it locally from EAP Identity");
++           vp = pairmake(request->packet, &request->packet->vps, "User-Name", handler->identity, T_OP_EQ);
++           if (!vp) {
++               goto error2;
++           }
++       } else {
++           /*
++        *      Paranoia.  If the NAS *did* set the
++        *      User-Name, and it doesn't match the
++        *      identity, the NAS is doing something
++        *      funny, so reject the request.
++        */
++           if (strncmp(handler->identity, vp->vp_strvalue,
++               MAX_STRING_LEN) != 0) {
++               RDEBUG("Identity does not match User-Name, setting from EAP Identity.");
++               goto error2;
++           }
++       }
+ 	}
+ 
+ 	handler->eap_ds = eap_buildds(handler, eap_packet_p);
+diff -r ede8120028a7 freeradius-server-3.0.3/src/modules/rlm_eap/libeap/eap_types.h
+--- a/freeradius-server-3.0.3/src/modules/rlm_eap/libeap/eap_types.h	Mon Nov 03 11:30:49 2014 +0100
++++ b/freeradius-server-3.0.3/src/modules/rlm_eap/libeap/eap_types.h	Sat Mar 07 08:47:32 2015 +0100
+@@ -44,6 +44,8 @@
+ 	PW_EAP_RESPONSE,
+ 	PW_EAP_SUCCESS,
+ 	PW_EAP_FAILURE,
++    PW_EAP_INITIATE,
++    PW_EAP_FINISH,
+ 	PW_EAP_MAX_CODES
+ } eap_code_t;
+ 
+diff -r ede8120028a7 freeradius-server-3.0.3/src/modules/rlm_eap/libeap/eapcommon.c
+--- a/freeradius-server-3.0.3/src/modules/rlm_eap/libeap/eapcommon.c	Mon Nov 03 11:30:49 2014 +0100
++++ b/freeradius-server-3.0.3/src/modules/rlm_eap/libeap/eapcommon.c	Sat Mar 07 08:47:32 2015 +0100
+@@ -138,7 +138,7 @@
+ 	if(reply->packet != NULL) return EAP_VALID;
+ 
+ 	total_length = EAP_HEADER_LEN;
+-	if (reply->code < 3) {
++	if (reply->code < 3 || reply->code == PW_EAP_FINISH) { // UMU: ERP
+ 		total_length += 1/* EAP Method */;
+ 		if (reply->type.data && reply->type.length > 0) {
+ 			total_length += reply->type.length;
+@@ -158,12 +158,12 @@
+ 	memcpy(header->length, &total_length, sizeof(total_length));
+ 
+ 	/*
+-	 *	Request and Response packets are special.
++	 *	Request and Response packets are special. UMU: And INITIATE
+ 	 */
+ 	if ((reply->code == PW_EAP_REQUEST) ||
+-	    (reply->code == PW_EAP_RESPONSE)) {
++	    (reply->code == PW_EAP_RESPONSE) ||
++        (reply->code == PW_EAP_FINISH)) {
+ 		header->data[0] = (reply->type.num & 0xFF);
+-
+ 		/*
+ 		 * Here since we cannot know the typedata format and length
+ 		 *
+diff -r ede8120028a7 freeradius-server-3.0.3/src/modules/rlm_eap/rlm_eap.c
+--- a/freeradius-server-3.0.3/src/modules/rlm_eap/rlm_eap.c	Mon Nov 03 11:30:49 2014 +0100
++++ b/freeradius-server-3.0.3/src/modules/rlm_eap/rlm_eap.c	Sat Mar 07 08:47:32 2015 +0100
+@@ -40,6 +40,8 @@
+ 	  offsetof(rlm_eap_t, mod_accounting_username_bug), NULL, "no" },
+ 	{ "max_sessions", PW_TYPE_INTEGER,
+ 	  offsetof(rlm_eap_t, max_sessions), NULL, "2048"},
++	{ "erp_realm", PW_TYPE_STRING_PTR,
++	  offsetof(rlm_eap_t, erp_realm), NULL, "home.org"},
+ 
+ 	{ NULL, -1, 0, NULL, NULL }	   /* end the list */
+ };
+@@ -262,6 +264,49 @@
+ 	return 0;
+ }
+ 
++void dump_erp_keys(rlm_eap_t *inst)
++{
++    uint8_t buffer[256];
++    erp_key_t *key = NULL;
++    printf("XXXX> ====== ERP KEYS =====\n");
++    for (key = inst->erp_keys; key != NULL; key = key->next){
++        int len = fr_bin2hex(buffer, key->emsk, 9);
++        printf("emskName: %s     emsk:%s...\n", key->emsk_name, buffer);
++    }
++    printf("XXXX> ===========\n");
++}
++
++
++void insert_erp_key(rlm_eap_t *inst, char *emsk_name, uint8_t* emsk)
++{
++    if (get_erp_key(inst, emsk_name))
++        return;
++
++    erp_key_t *current = NULL, *key = malloc(sizeof(erp_key_t));
++    key->emsk_name = strdup(emsk_name);
++    memcpy(key->emsk, emsk, 64);
++    key->next = NULL;
++
++    if (inst->erp_keys == NULL)
++        inst->erp_keys = key;
++    else{
++        for (current = inst->erp_keys; current->next != NULL; current = current->next);
++        current->next = key;
++    }
++
++}
++
++uint8_t* get_erp_key(rlm_eap_t *inst, char *emsk_name)
++{
++    erp_key_t *key = NULL;
++    for (key = inst->erp_keys; key != NULL; key = key->next){
++        if (strcmp(emsk_name, key->emsk_name) == 0)
++            return key->emsk;
++    }
++    return NULL;
++}
++
++
+ 
+ /*
+  *	For backwards compatibility.
+@@ -318,6 +363,7 @@
+ 		return RLM_MODULE_INVALID;
+ 	}
+ 
++
+ #ifdef WITH_PROXY
+ 	/*
+ 	 *	If we're doing horrible tunneling work, remember it.
+@@ -389,7 +435,8 @@
+ 	 *	We are done, wrap the EAP-request in RADIUS to send
+ 	 *	with all other required radius attributes
+ 	 */
+-	rcode = eap_compose(handler);
++ 	rcode = eap_compose(handler);
++
+ 
+ 	/*
+ 	 *	Add to the list only if it is EAP-Request, OR if
+@@ -468,6 +515,68 @@
+ 		}
+ 	}
+ 
++	/*
++	 *	If it's an Access-Accept, Store EMSK (if available) and derive DSMK if requetsed
++	 */
++	if (request->reply->code == PW_CODE_AUTHENTICATION_ACK){
++        VALUE_PAIR *emsk = pairfind(request->reply->vps, 1130, 0, TAG_ANY);
++        if (emsk){
++            printf("XXXXX> EMSK derived! We should store it. \n");
++
++            /* TODO: SHOULD BE Session-ID instead of EMSK. */
++            int i;
++            unsigned char *emskNameStr, *emskName = prfplus(emsk->vp_octets, emsk->length, "EMSK\0\0\x08", 7, 8);
++            emskNameStr = malloc(200);
++            memset(emskNameStr, 0, 200);
++            for (i=0; i<8; i++){
++                char tmp[2];
++                sprintf(tmp, "%02x", emskName[i]);
++                strcat(emskNameStr, tmp);
++            }
++            strcat(emskNameStr, "@"); // ERP XXX TODO Change this for 
++            strcat(emskNameStr, inst->erp_realm); // ERP XXX TODO Change this for 
++            free(emskName);
++            insert_erp_key(inst, emskNameStr, emsk->vp_octets);
++            dump_erp_keys(inst);
++
++            // UPDATE UserName
++            VALUE_PAIR* username = pairfind(request->reply->vps, PW_USER_NAME, 0, TAG_ANY);
++            username->vp_octets = strdup(emskNameStr);
++            username->length = strlen(emskNameStr);
++
++            DICT_ATTR *da = dict_attrbyname("DSRK-Req");
++            VALUE_PAIR	*dsrk_req = pairfind(request->packet->vps, da->attr, da->vendor, TAG_ANY);
++            if (dsrk_req){
++                char buffer[512];
++                int labellen = strlen("dsrk@ietf.org") + 1 + dsrk_req->length + 2;
++                char *dsrkLabel = malloc(labellen);
++                char *p = dsrkLabel;
++
++                memcpy(p, "dsrk@ietf.org", strlen("dsrk@ietf.org"));
++                p += strlen("dsrk@ietf.org");
++                *p++= 0x00;
++                memcpy(p, dsrk_req->vp_octets, dsrk_req->length);
++                p += dsrk_req->length;
++                *p++ = 0x00;
++                *p++ = 0x40;
++
++                uint8_t* dsrk = prfplus(emsk->vp_octets, 64, dsrkLabel, labellen, 64);
++                int len = fr_bin2hex(buffer, dsrk, 64);
++                printf("XXXX> DSRK derived: [%s]\n", buffer);
++                dsrk_req = pairmake(request->packet, &request->reply->vps, "DSRK-Req", "", T_OP_EQ);
++                dsrk_req->vp_octets = malloc(64);
++                dsrk_req->length = 64;
++                memcpy(dsrk_req->vp_octets, dsrk, 64);
++            }
++            else{
++                printf("XXX> NO DSRK FOUND\n");
++            }
++        }
++
++
++
++    }
++
+ 	return rcode;
+ }
+ 
+@@ -544,6 +653,24 @@
+ 
+ 
+ #ifdef WITH_PROXY
++
++/*ERP REQUIRED */
++static rlm_rcode_t CC_HINT(nonnull) mod_pre_proxy(void *inst, REQUEST *request)
++{
++    rlm_eap_t		*instance = (rlm_eap_t*) inst;
++
++	VALUE_PAIR	*vp = pairfind(request->packet->vps, PW_EAP_MESSAGE, 0, TAG_ANY);
++    DICT_ATTR *da = dict_attrbyname("DSRK-Req");
++	VALUE_PAIR	*dsrk_req = pairfind(request->packet->vps, da->attr, da->vendor, TAG_ANY);
++
++    if (vp && !dsrk_req){
++        // XXX TODO Should not use visited.org hadcoded, and make better guesses
++        dsrk_req = pairmake(request->packet, &request->proxy->vps, "DSRK-Req", instance->erp_realm, T_OP_EQ);
++    }
++    
++    return RLM_MODULE_OK;
++}
++
+ /*
+  *	If we're proxying EAP, then there may be magic we need
+  *	to do.
+@@ -556,6 +683,8 @@
+ 	VALUE_PAIR	*vp;
+ 	eap_handler_t	*handler;
+ 	vp_cursor_t	cursor;
++    rlm_eap_t		*eap_inst = (rlm_eap_t*) inst;
++
+ 
+ 	/*
+ 	 *	Just in case the admin lists EAP in post-proxy-type Fail.
+@@ -648,6 +777,23 @@
+ 	 */
+ 	if (!request->proxy_reply) return RLM_MODULE_NOOP;
+ 
++
++	/* UMU ERP */
++    printf("AAAAA\n");
++    DICT_ATTR *da = dict_attrbyname("DSRK-Req");
++    VALUE_PAIR	*dsrk_req = pairfind(request->proxy_reply->vps, da->attr, da->vendor, TAG_ANY);
++    if (dsrk_req){
++        char newEMSKname[256];
++        printf("XXXXX> Store DSRK associated to EMSK name\n");
++        vp = pairfind(request->proxy_reply->vps, PW_USER_NAME, 0, TAG_ANY);
++        strlcpy(newEMSKname, vp->vp_octets, vp->length);
++        char *p = strpbrk(newEMSKname, "@");
++        strcpy(p+1, eap_inst->erp_realm);  
++        insert_erp_key(eap_inst, newEMSKname, dsrk_req->vp_octets);
++        dump_erp_keys(eap_inst);    
++    }
++
++
+ 	/*
+ 	 *	There may be more than one Cisco-AVPair.
+ 	 *	Ensure we find the one with the LEAP attribute.
+@@ -782,8 +928,8 @@
+ 		NULL,			/* preaccounting */
+ 		NULL,			/* accounting */
+ 		NULL,			/* checksimul */
+-		NULL,			/* pre-proxy */
+ #ifdef WITH_PROXY
++		mod_pre_proxy,			/* pre-proxy */
+ 		mod_post_proxy,		/* post-proxy */
+ #else
+ 		NULL,
+diff -r ede8120028a7 freeradius-server-3.0.3/src/modules/rlm_eap/rlm_eap.h
+--- a/freeradius-server-3.0.3/src/modules/rlm_eap/rlm_eap.h	Mon Nov 03 11:30:49 2014 +0100
++++ b/freeradius-server-3.0.3/src/modules/rlm_eap/rlm_eap.h	Sat Mar 07 08:47:32 2015 +0100
+@@ -41,6 +41,13 @@
+ 	void			*instance;
+ } eap_module_t;
+ 
++/* ERP */
++typedef struct erp_key {
++    char *emsk_name;
++    uint8_t emsk[64];
++    struct erp_key *next;
++} erp_key_t;
++
+ /*
+  * This structure contains eap's persistent data.
+  * sessions = remembered sessions, in a tree for speed.
+@@ -73,8 +80,17 @@
+ 
+ 	char const	*xlat_name; /* no xlat's yet */
+ 	fr_randctx	rand_pool;
++
++    /* ERP */
++	char const	*erp_realm;    
++    erp_key_t *erp_keys;
+ } rlm_eap_t;
+ 
++void dump_erp_keys(rlm_eap_t *inst);
++void insert_erp_key(rlm_eap_t *inst, char *emsk_name, uint8_t* emsk);
++uint8_t* get_erp_key(rlm_eap_t *inst, char *emsk_name);
++
++
+ /*
+  *	For simplicity in the rest of the code.
+  */

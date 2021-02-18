@@ -1,0 +1,765 @@
+diff -r 07664260db6a moonshot/libeap/src/eap_common/eap_common.c
+--- a/moonshot/libeap/src/eap_common/eap_common.c	Fri Jun 20 12:33:28 2014 +0200
++++ b/moonshot/libeap/src/eap_common/eap_common.c	Sat Mar 07 08:46:23 2015 +0100
+@@ -154,6 +154,22 @@
+ 
+ 
+ /**
++ * eap_get_code - Get EAP Code from wpabuf
++ * @msg: Buffer starting with an EAP header
++ * Returns: The Code field from the EAP header
++ */
++u8 eap_get_code(const struct wpabuf *msg)
++{
++	const struct eap_hdr *eap;
++
++	if (wpabuf_len(msg) < sizeof(*eap))
++		return 0;
++
++	eap = wpabuf_head(msg);
++	return eap->code;
++}
++
++/**
+  * eap_get_id - Get EAP Identifier from wpabuf
+  * @msg: Buffer starting with an EAP header
+  * Returns: The Identifier field from the EAP header
+diff -r 07664260db6a moonshot/libeap/src/eap_common/eap_common.h
+--- a/moonshot/libeap/src/eap_common/eap_common.h	Fri Jun 20 12:33:28 2014 +0200
++++ b/moonshot/libeap/src/eap_common/eap_common.h	Sat Mar 07 08:46:23 2015 +0100
+@@ -27,6 +27,7 @@
+ 			      u8 code, u8 identifier);
+ void eap_update_len(struct wpabuf *msg);
+ u8 eap_get_id(const struct wpabuf *msg);
++u8 eap_get_code(const struct wpabuf *msg);
+ EapType eap_get_type(const struct wpabuf *msg);
+ 
+ #ifdef __cplusplus
+diff -r 07664260db6a moonshot/libeap/src/eap_common/eap_defs.h
+--- a/moonshot/libeap/src/eap_common/eap_defs.h	Fri Jun 20 12:33:28 2014 +0200
++++ b/moonshot/libeap/src/eap_common/eap_defs.h	Sat Mar 07 08:46:23 2015 +0100
+@@ -37,7 +37,7 @@
+ #endif /* _MSC_VER */
+ 
+ enum { EAP_CODE_REQUEST = 1, EAP_CODE_RESPONSE = 2, EAP_CODE_SUCCESS = 3,
+-       EAP_CODE_FAILURE = 4 };
++       EAP_CODE_FAILURE = 4, EAP_CODE_INITIATE = 5, EAP_CODE_FINISH = 6 };
+ 
+ /* EAP Request and Response data begins with one octet Type. Success and
+  * Failure do not have additional data. */
+@@ -73,10 +73,13 @@
+ 	EAP_TYPE_AKA_PRIME = 50 /* draft-arkko-eap-aka-kdf-10.txt */,
+ 	EAP_TYPE_GPSK = 51 /* RFC 5433 */,
+ 	EAP_TYPE_PWD = 52 /* RFC 5931 */,
++
++    EAP_TYPE_RE_AUTH_START = 1, /* RFC 6696 */
++    EAP_TYPE_RE_AUTH = 2, /* RFC 6696 */    
++
+ 	EAP_TYPE_EXPANDED = 254 /* RFC 3748 */
+ } EapType;
+ 
+-
+ /* SMI Network Management Private Enterprise Code for vendor specific types */
+ enum {
+ 	EAP_VENDOR_IETF = 0,
+diff -r 07664260db6a moonshot/libeap/src/eap_peer/eap.c
+--- a/moonshot/libeap/src/eap_peer/eap.c	Fri Jun 20 12:33:28 2014 +0200
++++ b/moonshot/libeap/src/eap_peer/eap.c	Sat Mar 07 08:46:23 2015 +0100
+@@ -32,6 +32,7 @@
+ #include "eap_common/eap_wsc_common.h"
+ #include "eap_i.h"
+ #include "eap_config.h"
++#include "crypto/sha256.h"
+ 
+ #define STATE_MACHINE_DATA struct eap_sm
+ #define STATE_MACHINE_DEBUG_PREFIX "EAP"
+@@ -52,7 +53,35 @@
+ static const char * eap_sm_decision_txt(EapDecision decision);
+ #endif /* CONFIG_CTRL_IFACE || !CONFIG_NO_STDOUT_DEBUG */
+ 
++static void eap_sm_processInitiateReauthStart(struct eap_sm *sm, const struct wpabuf *req);
+ 
++const char * eap_get_config_homeRealm(struct eap_sm *sm)
++{
++	struct eap_peer_config *config = eap_get_config(sm);
++	if (config == NULL)
++		return NULL;
++	return config->homeRealm;
++}
++
++const char * eap_get_config_acceptorRealm(struct eap_sm *sm)
++{
++	struct eap_peer_config *config = eap_get_config(sm);
++	if (config == NULL)
++		return NULL;
++	return config->acceptorRealm;
++}
++
++static int eap_sm_nextId(struct eap_sm *sm, int id)
++{
++	if (id < 0) {
++		/* RFC 3748 Ch 4.1: recommended to initialize Identifier with a
++		 * random number */
++		id = rand() & 0xff;
++		if (id != sm->lastId)
++			return id;
++	}
++	return (id + 1) & 0xff;
++}
+ 
+ static Boolean eapol_get_bool(struct eap_sm *sm, enum eapol_bool_var var)
+ {
+@@ -99,6 +128,8 @@
+ }
+ 
+ 
++
++
+ /**
+  * eap_allowed_method - Check whether EAP method is allowed
+  * @sm: Pointer to EAP state machine allocated with eap_peer_sm_init()
+@@ -169,6 +200,113 @@
+ 	sm->prev_failure = 0;
+ }
+ 
++u8* prfplus(const u8 *key, size_t key_len, const u8 *seed,
++            size_t seed_len, size_t buf_len)
++{
++    char i, iterations = buf_len / SHA256_MAC_LEN + 1;
++    u8* buf = os_malloc(SHA256_MAC_LEN * iterations);
++    u8 tmp[SHA256_MAC_LEN + seed_len + 1], *pos = buf;
++    int tmpLen = 0;
++
++    /* first iteration */
++    memcpy(tmp, seed, seed_len);
++    tmp[seed_len] =  1;
++    tmpLen = seed_len + 1;
++    hmac_sha256(key, key_len, tmp, tmpLen, pos);
++    pos += SHA256_MAC_LEN;
++    
++    for (i = 2; i <= iterations; i++){
++        memcpy(tmp, pos - SHA256_MAC_LEN, SHA256_MAC_LEN);
++        memcpy(tmp + SHA256_MAC_LEN, seed, seed_len);
++        tmp[SHA256_MAC_LEN + seed_len] =  i;
++        tmpLen = SHA256_MAC_LEN + seed_len + 1;
++        hmac_sha256(key, key_len, tmp, tmpLen, pos);
++        pos += SHA256_MAC_LEN;
++    }
++    return buf;
++}
++
++static void eap_sm_setDsrk(struct eap_sm *sm){
++    if (sm->realm != NULL){
++        printf("XXX> Derividng DSRK for %s\n", sm->realm);
++        int labellen = strlen("dsrk@ietf.org") + 1 +strlen(sm->realm) + 2;
++        char *dsrkLabel = malloc(labellen);
++        char *p = dsrkLabel;
++
++        memcpy(p, "dsrk@ietf.org", strlen("dsrk@ietf.org"));
++        p += strlen("dsrk@ietf.org");
++        *p++= 0x00;
++        memcpy(p, sm->realm, strlen(sm->realm));
++        p += strlen(sm->realm);
++        *p++ = 0x00;
++        *p++ = 0x40;            
++                    
++        char *dsrk = prfplus(sm->emsk, sm->keyLen, dsrkLabel, labellen, sm->keyLen);
++
++        char tmp[512];
++        strcpy(tmp, "/tmp/dsrk@");
++        strcat(tmp, sm->realm);
++        FILE *dsrkfile = fopen(tmp, "wb");
++        fwrite(dsrk, 1, sm->keyLen, dsrkfile);
++        wpa_hexdump_ascii(MSG_INFO, "Writen DSRK: ", dsrk, sm->keyLen);
++        fclose(dsrkfile);
++    }
++    else{
++        printf("XXX> NO REAL\n");
++    }   
++}
++
++static int eap_sm_deriveEmskName(struct eap_sm *sm)
++{
++    /* TODO: SHOULD BE Session-ID instead of EMSK. */
++    int i;
++    unsigned char *emskName = prfplus(sm->emsk, sm->keyLen, "EMSK\0\0\x08", 7, 8);
++    sm->emskName = os_zalloc(17);
++    for (i=0; i<8; i++){
++        char tmp[2];
++        sprintf(tmp, "%02x", emskName[i]);
++        strcat(sm->emskName, tmp);
++    }
++    free(emskName);
++    printf("Derive EMSKNAME: %s\n", sm->emskName); 
++
++    return 0;
++}
++
++
++SM_STATE(EAP, ERP_INITIALIZE)
++{
++	SM_ENTRY(EAP, ERP_INITIALIZE);
++    FILE* emskFile = fopen("/tmp/emsk", "rb");
++    if (emskFile == NULL)
++        eapol_set_bool(sm, EAPOL_implicitBootstrap, TRUE);
++    else{
++        eapol_set_bool(sm, EAPOL_implicitBootstrap, FALSE);
++        fseek(emskFile, 0L, SEEK_END);
++        sm->keyLen = ftell(emskFile);
++        fseek(emskFile, 0L, SEEK_SET);
++        sm->emsk = os_zalloc(sm->keyLen);
++        fread(sm->emsk, 1, sm->keyLen, emskFile);
++        fclose(emskFile);
++        wpa_hexdump_ascii(MSG_INFO, "XXXXX> Loaded EMSK", sm->emsk, sm->keyLen);
++        eap_sm_deriveEmskName(sm);
++    }    
++}
++
++SM_STATE(EAP, ERP_IDLE)
++{
++	SM_ENTRY(EAP, ERP_IDLE);
++}
++
++SM_STATE(EAP, ERP_RECEIVED)
++{
++	const struct wpabuf *eapReqData;
++
++	SM_ENTRY(EAP, ERP_RECEIVED);
++	eapReqData = eapol_get_eapReqData(sm);
++	eap_sm_parseEapReq(sm, eapReqData);
++}
++
+ 
+ /*
+  * This state is reached whenever service from the lower layer is interrupted
+@@ -372,7 +510,16 @@
+ 	    sm->m->isKeyAvailable(sm, sm->eap_method_priv)) {
+ 		os_free(sm->eapKeyData);
+ 		sm->eapKeyData = sm->m->getKey(sm, sm->eap_method_priv,
+-					       &sm->eapKeyDataLen);
++					       &sm->eapKeyDataLen);      
++
++        if (sm->m->get_emsk)
++            sm->emsk = sm->m->get_emsk(sm, sm->eap_method_priv, &sm->keyLen);
++        else
++            printf("XXXXX> NO EMSK!!!\n");
++
++        wpa_hexdump_ascii(MSG_INFO, "Derived MSK", sm->eapKeyData, sm->eapKeyDataLen);        
++        wpa_hexdump_ascii(MSG_INFO, "Derived EMSK", sm->emsk, sm->keyLen);        
++
+ 	}
+ }
+ 
+@@ -397,6 +544,13 @@
+ 	eapol_set_int(sm, EAPOL_idleWhile, sm->ClientTimeout);
+ }
+ 
++SM_STATE(EAP, ERP_SEND)
++{
++	SM_ENTRY(EAP, ERP_SEND);
++    sm->lastId = sm->reqId;
++    eapol_set_bool(sm, EAPOL_eapResp, TRUE);
++	eapol_set_bool(sm, EAPOL_eapReq, FALSE);
++}
+ 
+ /*
+  * This state signals the lower layer that the request was discarded, and no
+@@ -409,6 +563,191 @@
+ 	eapol_set_bool(sm, EAPOL_eapNoResp, TRUE);
+ }
+ 
++SM_STATE(EAP, ERP_DISCARD)
++{
++	SM_ENTRY(EAP, ERP_DISCARD);
++	eapol_set_bool(sm, EAPOL_eapReq, FALSE);
++	eapol_set_bool(sm, EAPOL_eapNoResp, TRUE);
++}
++
++SM_STATE(EAP, ERP_REAUTH_START)
++{
++	const struct wpabuf *eapReqData;
++
++	SM_ENTRY(EAP, ERP_REAUTH_START);
++	eapReqData = eapol_get_eapReqData(sm);
++	eap_sm_processInitiateReauthStart(sm, eapReqData);    
++}
++
++SM_STATE(EAP, ERP_FINISH)
++{
++	const struct wpabuf *eapReqData;
++    char tmp[256];
++
++	SM_ENTRY(EAP, ERP_FINISH);
++	eapReqData = eapol_get_eapReqData(sm);
++    wpa_hexdump(MSG_INFO, "Received EAP_FINISH: ", wpabuf_head(eapReqData), wpabuf_len(eapReqData));
++    hmac_sha256(sm->rIK, sm->keyLen, wpabuf_head(eapReqData), wpabuf_len(eapReqData) - 16, tmp);
++
++    if (memcmp(tmp, wpabuf_head(eapReqData) + wpabuf_len(eapReqData) - 16, 16)){
++        printf("XXX> ERRORRRRRR\n");
++    }
++    else{
++        printf("XXX> Verification SUCCESS\n");
++        int msg_len = 0;
++        char* pos = eap_hdr_validate(EAP_VENDOR_IETF, EAP_TYPE_RE_AUTH, eapReqData, &msg_len);
++        pos += 3; // skip flags, reserved and seq
++        sm->realm = NULL;
++        // READ TLVs
++        while (pos - (char*) wpabuf_head(eapReqData) < msg_len - 17){
++            char type = *pos++;
++            char len = *pos++;
++            if (type == 4){
++                sm->realm = malloc(len + 1);
++                memcpy(sm->realm, pos, len);
++                sm->realm[len] = 0;
++                printf("XXX> Found realm %s\n", sm->realm);
++            }
++            pos += len;
++        }
++        
++
++        // Update realm
++    }
++
++}
++
++SM_STATE(EAP, ERP_DERIVE)
++{
++	const struct wpabuf *eapReqData;
++
++	SM_ENTRY(EAP, ERP_DERIVE);
++	eapReqData = eapol_get_eapReqData(sm);
++    printf("Deriving keys....%s\n", sm->realm);
++
++    eap_sm_setDsrk(sm);
++
++    sm->eapKeyDataLen = sm->keyLen;
++    sm->eapKeyData = malloc(sm->keyLen);
++    memcpy(sm->eapKeyData, sm->rMSK, sm->keyLen);
++    
++}
++
++static void eap_sm_deriveErpKeys(struct eap_sm *sm, char* rootKey)
++{
++    int i;
++    char rRKlabel[] = "ERP Re-authentication Root Key@ietf.org\x0\x0\x40";
++    /* cryptosuite is fixed to 2 = HMAC-SHA256-128 */
++    char rIKlabel[] = "Re-authentication Integrity Key@ietf.org\x0\x02\x0\x40";
++    /* TODO SEQ is fixed to \x0\x0 */
++    char rMSKlabel[] = "Re-authentication Master Session Key@ietf.org\x0\x0\x0\x0\x40";
++
++    sm->rRK = prfplus(rootKey, sm->keyLen, rRKlabel, sizeof(rRKlabel) - 1, sm->keyLen);
++    wpa_hexdump_ascii(MSG_INFO, "XXXXX> Derive rRK", sm->rRK, sm->keyLen);
++    sm->rIK = prfplus(sm->rRK, sm->keyLen, rIKlabel, sizeof(rIKlabel) - 1, sm->keyLen);
++    wpa_hexdump_ascii(MSG_INFO, "XXXXX> Derive rIK", sm->rIK, sm->keyLen);
++    sm->rMSK = prfplus(sm->rRK, sm->keyLen, rMSKlabel, sizeof(rMSKlabel) - 1, sm->keyLen);
++    wpa_hexdump_ascii(MSG_INFO, "XXXXX> Derive rMSK", sm->rMSK, sm->keyLen);
++}
++
++static struct wpabuf * eap_sm_buildInitiateReAuth(struct eap_sm * sm)
++{
++	struct wpabuf *resp = NULL;
++    char tmp[256];
++    int i;
++
++    // FLAGS + SEQ + TLV_TYPE + TLV_LENGTH + TLV_VALUE + CRYPTOSUITE + AUTHENTICATION TAG
++    size_t packetlen = 1 + 2 + 1 + 1 + (16 + 1 + strlen(sm->realm)) + 1 + 16;
++    printf("XXXXX> Packet len: %d\n", packetlen);
++
++    // TODO: use right ID
++    resp = eap_msg_alloc(EAP_VENDOR_IETF, EAP_TYPE_RE_AUTH,
++                        packetlen, 
++                        EAP_CODE_INITIATE, 0);
++	if (resp == NULL)
++		return NULL;
++
++	wpabuf_put_u8(resp, sm->explicitBoostrap << 6); // FLAGS
++	wpabuf_put_be16(resp, 0); // SEQ TODO: Use right sequence number
++	wpabuf_put_u8(resp, 1); // TLV TYPE
++	wpabuf_put_u8(resp, (16 + 1 + strlen(sm->realm))); // TLV LENGTH
++	wpabuf_put_str(resp, sm->emskName); // emskName
++	wpabuf_put_str(resp, "@"); // @
++	wpabuf_put_str(resp, sm->realm); // realm
++	wpabuf_put_u8(resp, 2); // CRYPTOSUITE
++    
++    // AUTHENTICATION TAG (generated with rIK)
++    hmac_sha256(sm->rIK, sm->keyLen, wpabuf_head(resp), wpabuf_len(resp), tmp);
++    for (i=0; i<16; i++)        
++        wpabuf_put_u8(resp, tmp[i]);
++    
++    wpa_hexdump(MSG_INFO, "XXXXXX> EAP Initiate RE-auth start 3", wpabuf_head(resp), wpabuf_len(resp));
++	return resp;
++}
++
++
++static u8* eap_sm_getDsrk(struct eap_sm *sm, char* realm)
++{
++    FILE *dsrkFile = NULL;
++    size_t dsrkLen = 0;
++    u8* dsrk = NULL;
++    char filename[512];
++
++    if (realm == NULL){
++        printf("XXXXX> Realm not specified. No DSRK\n");
++        return NULL;
++    }
++
++    strcpy(filename, "/tmp/");
++    strcat(filename, "dsrk@");
++    strcat(filename, realm);
++
++    dsrkFile = fopen(filename, "rb");
++    if (dsrkFile == NULL){
++        printf("XXXXX> No DSRK file for emskName %s and realm %s\n", sm->emskName, realm);
++        return NULL;
++    }
++
++    fseek(dsrkFile, 0L, SEEK_END);
++    dsrkLen = ftell(dsrkFile);
++    fseek(dsrkFile, 0L, SEEK_SET);
++    dsrk = os_zalloc(dsrkLen);
++    fread(dsrk, 1, dsrkLen, dsrkFile);
++    fclose(dsrkFile);
++    wpa_hexdump_ascii(MSG_INFO, "XXXXX> Loaded DSRK", dsrk, dsrkLen);
++
++    return dsrk;
++}
++
++
++SM_STATE(EAP, ERP_INITIATE)
++{
++    char* keyNameNAI = NULL;
++	SM_ENTRY(EAP, ERP_INITIATE);
++    u8* root_key = eap_sm_getDsrk(sm, sm->realm);
++    
++    if (root_key == NULL){
++        free(sm->realm);
++        sm->realm = strdup(eap_get_config_homeRealm(sm));
++        root_key = sm->emsk;
++        sm->explicitBoostrap = TRUE;
++    }
++
++    keyNameNAI = os_malloc(strlen(sm->emskName) + 1 + strlen(sm->realm) + 1);
++    strcpy(keyNameNAI, sm->emskName);
++    strcat(keyNameNAI, "@");
++    strcat(keyNameNAI, sm->realm);
++    
++    printf("XXXXX> KeyNameNAI: %s, explicitBootstrapping: %d, DSRK: %x\n", keyNameNAI, sm->explicitBoostrap, root_key[0]);
++
++    eap_sm_deriveErpKeys(sm, root_key);
++
++    sm->eapRespData = eap_sm_buildInitiateReAuth(sm);
++    
++}
++
++
++
+ 
+ /*
+  * Handles requests for Identity method and builds a response.
+@@ -468,6 +807,21 @@
+ 		sm->eapKeyAvailable = TRUE;
+ 	eapol_set_bool(sm, EAPOL_eapSuccess, TRUE);
+ 
++    if (sm->emsk != NULL){
++        FILE *emsk = fopen("/tmp/emsk", "wb");
++        fwrite(sm->emsk, 1, sm->keyLen, emsk);
++        wpa_hexdump_ascii(MSG_INFO, "Writen EMSK", sm->emsk, sm->keyLen);
++        fclose(emsk);
++
++        // If implicit bootstrapping ...
++        if (eap_get_config_acceptorRealm(sm)){
++            sm->realm = strdup(eap_get_config_acceptorRealm(sm));
++
++            // derive dsrk
++            eap_sm_setDsrk(sm);
++        }
++    }
++
+ 	/*
+ 	 * RFC 4137 does not clear eapReq here, but this seems to be required
+ 	 * to avoid processing the same request twice when state machine is
+@@ -610,6 +964,8 @@
+ {
+ 	int duplicate = eap_peer_req_is_duplicate(sm);
+ 
++        printf("XXXXX> eap_peer_sm_step_received. sm->selectedMethod: %d, sm->reqMethod: %d,"
++                    "sm->rxResp: %d, sm->rxReq: %d, sm->rxInitiate:%d \n", sm->selectedMethod, sm->reqMethod, sm->rxResp, sm->rxReq, sm->rxInitiate);
+ 	/*
+ 	 * Two special cases below for LEAP are local additions to work around
+ 	 * odd LEAP behavior (EAP-Success in the middle of authentication and
+@@ -659,7 +1015,7 @@
+ {
+ 	switch (sm->EAP_state) {
+ 	case EAP_INITIALIZE:
+-		SM_ENTER(EAP, IDLE);
++		SM_ENTER(EAP, ERP_INITIALIZE);
+ 		break;
+ 	case EAP_DISABLED:
+ 		if (eapol_get_bool(sm, EAPOL_portEnabled) &&
+@@ -703,7 +1059,47 @@
+ 		break;
+ 	case EAP_FAILURE:
+ 		break;
++    case EAP_ERP_INITIALIZE:
++		if (eapol_get_bool(sm, EAPOL_implicitBootstrap))
++            SM_ENTER(EAP, IDLE);
++        else
++            SM_ENTER(EAP, ERP_IDLE);
++        break;
++    case EAP_ERP_IDLE:
++        if (eapol_get_bool(sm, EAPOL_eapReq))
++            SM_ENTER(EAP, ERP_RECEIVED);
++        break;
++    case EAP_ERP_RECEIVED:
++        printf("rxInititate: %d, rxFinish: %d, lastId: %d, reqType: %d\n", sm->rxInitiate, sm->rxFinish, sm->lastId, sm->reqMethod);
++        if (sm->rxInitiate && (sm->lastId == -1) && (sm->reqMethod == EAP_TYPE_RE_AUTH_START))
++            SM_ENTER(EAP, ERP_REAUTH_START);
++        else if (sm->rxFinish && (sm->lastId == sm->reqId) && (sm->reqMethod == EAP_TYPE_RE_AUTH))
++            SM_ENTER(EAP, ERP_FINISH);
++        else
++            SM_ENTER(EAP, ERP_DISCARD);
++        break;
++	case EAP_ERP_DISCARD:
++		SM_ENTER(EAP, ERP_IDLE);
++		break;
++	case EAP_ERP_REAUTH_START:
++		SM_ENTER(EAP, ERP_INITIATE);
++		break;
++	case EAP_ERP_INITIATE:
++		SM_ENTER(EAP, ERP_SEND);
++		break;
++	case EAP_ERP_SEND:
++		SM_ENTER(EAP, ERP_IDLE);
++		break;
++	case EAP_ERP_FINISH:
++		SM_ENTER(EAP, ERP_DERIVE);
++		break;
++	case EAP_ERP_DERIVE:
++        SM_ENTER(EAP, SUCCESS);
++		break;
+ 	}
++    
++    printf("XXXXX> EAP State: %d\n", sm->EAP_state);
++
+ }
+ 
+ 
+@@ -716,6 +1112,7 @@
+ 	else if (!eapol_get_bool(sm, EAPOL_portEnabled) || sm->force_disabled)
+ 		SM_ENTER_GLOBAL(EAP, DISABLED);
+ 	else if (sm->num_rounds > EAP_MAX_AUTH_ROUNDS) {
++        printf("XXXXX> SM_STEP4\n");
+ 		/* RFC 4137 does not place any limit on number of EAP messages
+ 		 * in an authentication session. However, some error cases have
+ 		 * ended up in a state were EAP messages were sent between the
+@@ -872,6 +1269,28 @@
+ 			  pos, be_to_host16(hdr->length) - 5);
+ }
+ 
++static void eap_sm_processInitiateReauthStart(struct eap_sm *sm, const struct wpabuf *req)
++{
++    size_t i, msg_len;
++    u8 *pos = NULL;
++
++	pos = eap_hdr_validate(EAP_VENDOR_IETF, EAP_TYPE_RE_AUTH_START, req,
++			       &msg_len);
++              
++    pos++; // Skip RESERVED
++
++    // If Type is DOMAIN_NAME
++    if (*pos == 4){
++        int len = *(++pos);
++        if (len > 0){
++            sm->realm = os_zalloc(len + 1);
++            memcpy(sm->realm, pos+1, len);
++        }
++    }
++    if (sm->realm != NULL)
++        printf("XXXXX> Received EAP Initiate Reauth, with realm <%s>\n", sm->realm);
++}
++
+ 
+ #ifdef PCSC_FUNCS
+ static int eap_sm_imsi_identity(struct eap_sm *sm,
+@@ -1069,7 +1488,7 @@
+ 	size_t plen;
+ 	const u8 *pos;
+ 
+-	sm->rxReq = sm->rxResp = sm->rxSuccess = sm->rxFailure = FALSE;
++	sm->rxReq = sm->rxResp = sm->rxSuccess = sm->rxFailure = sm->rxInitiate = sm->rxFinish = FALSE;
+ 	sm->reqId = 0;
+ 	sm->reqMethod = EAP_TYPE_NONE;
+ 	sm->reqVendor = EAP_VENDOR_IETF;
+@@ -1152,6 +1571,37 @@
+ 		wpa_printf(MSG_DEBUG, "EAP: Received EAP-Failure");
+ 		sm->rxFailure = TRUE;
+ 		break;
++
++    // COMPLETEME!!!
++    case EAP_CODE_INITIATE:
++		if (plen < sizeof(*hdr) + 1) {
++			wpa_printf(MSG_DEBUG, "EAP: Too short EAP-Initiate - "
++				   "no Type field");
++			return;
++		}
++        sm->rxInitiate = TRUE;
++		pos = (const u8 *) (hdr + 1);
++		sm->reqMethod = *pos++;
++		wpa_printf(MSG_DEBUG, "EAP: Received EAP-Initiate id=%d "
++			   "method=%u",
++			   sm->reqId, sm->reqMethod, sm->reqVendor,
++			   sm->reqVendorMethod);
++		break;
++
++    case EAP_CODE_FINISH:
++		if (plen < sizeof(*hdr) + 1) {
++			printf("EAP: Too short EAP-Finish - no Type field\n");
++			return;
++		}
++        sm->rxFinish = TRUE;
++		pos = (const u8 *) (hdr + 1);
++		sm->reqMethod = *pos++;
++		wpa_printf(MSG_DEBUG, "EAP: Received EAP-Finish id=%d "
++			   "method=%u",
++			   sm->reqId, sm->reqMethod, sm->reqVendor,
++			   sm->reqVendorMethod);
++		break;
++
+ 	default:
+ 		wpa_printf(MSG_DEBUG, "EAP: Ignored EAP-Packet with unknown "
+ 			   "code %d", hdr->code);
+@@ -1160,6 +1610,7 @@
+ }
+ 
+ 
++
+ static void eap_peer_sm_tls_event(void *ctx, enum tls_event ev,
+ 				  union tls_event_data *data)
+ {
+diff -r 07664260db6a moonshot/libeap/src/eap_peer/eap.h
+--- a/moonshot/libeap/src/eap_peer/eap.h	Fri Jun 20 12:33:28 2014 +0200
++++ b/moonshot/libeap/src/eap_peer/eap.h	Sat Mar 07 08:46:23 2015 +0100
+@@ -104,7 +104,9 @@
+ 	 *
+ 	 * EAP state machines reads this value.
+ 	 */
+-	EAPOL_altReject
++	EAPOL_altReject,
++
++    EAPOL_implicitBootstrap
+ };
+ 
+ /**
+diff -r 07664260db6a moonshot/libeap/src/eap_peer/eap_config.h
+--- a/moonshot/libeap/src/eap_peer/eap_config.h	Fri Jun 20 12:33:28 2014 +0200
++++ b/moonshot/libeap/src/eap_peer/eap_config.h	Sat Mar 07 08:46:23 2015 +0100
+@@ -672,6 +672,11 @@
+ 	 *         instead of plaintext password
+ 	 */
+ 	u32 flags;
++
++    Boolean erpSupported;
++    char* homeRealm;
++    char* acceptorRealm;
++    
+ };
+ 
+ 
+diff -r 07664260db6a moonshot/libeap/src/eap_peer/eap_i.h
+--- a/moonshot/libeap/src/eap_peer/eap_i.h	Fri Jun 20 12:33:28 2014 +0200
++++ b/moonshot/libeap/src/eap_peer/eap_i.h	Sat Mar 07 08:46:23 2015 +0100
+@@ -282,7 +282,9 @@
+ 		EAP_INITIALIZE, EAP_DISABLED, EAP_IDLE, EAP_RECEIVED,
+ 		EAP_GET_METHOD, EAP_METHOD, EAP_SEND_RESPONSE, EAP_DISCARD,
+ 		EAP_IDENTITY, EAP_NOTIFICATION, EAP_RETRANSMIT, EAP_SUCCESS,
+-		EAP_FAILURE
++		EAP_FAILURE, EAP_ERP_INITIALIZE, EAP_ERP_IDLE, EAP_ERP_RECEIVED,
++        EAP_ERP_DISCARD, EAP_ERP_SEND, EAP_ERP_FINISH,
++        EAP_ERP_REAUTH_START, EAP_ERP_DERIVE, EAP_ERP_INITIATE
+ 	} EAP_state;
+ 	/* Long-term local variables */
+ 	EapType selectedMethod;
+@@ -290,6 +292,15 @@
+ 	int lastId;
+ 	struct wpabuf *lastRespData;
+ 	EapDecision decision;
++    Boolean explicitBoostrap;
++
++    char* emskName;
++    u8* emsk;
++    u8* rRK;
++    u8* rIK;
++    u8* rMSK;
++    size_t keyLen;
++    
+ 	/* Short-term local variables */
+ 	Boolean rxReq;
+ 	Boolean rxSuccess;
+@@ -299,6 +310,12 @@
+ 	int reqVendor;
+ 	u32 reqVendorMethod;
+ 	Boolean ignore;
++
++	Boolean rxInitiate;
++	Boolean rxFinish;
++    char* realm;
++    Boolean result;
++
+ 	/* Constants */
+ 	int ClientTimeout;
+ 
+@@ -309,7 +326,8 @@
+ 	u8 *eapKeyData; /* peer to lower layer */
+ 	size_t eapKeyDataLen; /* peer to lower layer */
+ 	const struct eap_method *m; /* selected EAP method */
+-	/* not defined in RFC 4137 */
++
++    /* not defined in RFC 4137 */
+ 	Boolean changed;
+ 	void *eapol_ctx;
+ 	struct eapol_callbacks *eapol_cb;
+diff -r 07664260db6a moonshot/libeap/src/eap_peer/eap_ttls.c
+--- a/moonshot/libeap/src/eap_peer/eap_ttls.c	Fri Jun 20 12:33:28 2014 +0200
++++ b/moonshot/libeap/src/eap_peer/eap_ttls.c	Sat Mar 07 08:46:23 2015 +0100
+@@ -347,7 +347,7 @@
+ 	os_free(data->key_data);
+ 	data->key_data = eap_peer_tls_derive_key(sm, &data->ssl,
+ 						 "ttls keying material",
+-						 EAP_TLS_KEY_LEN);
++						 EAP_TLS_KEY_LEN + EAP_EMSK_LEN);
+ 	if (!data->key_data) {
+ 		wpa_printf(MSG_INFO, "EAP-TTLS: Failed to derive key");
+ 		return -1;
+@@ -2193,6 +2193,24 @@
+ 	return key;
+ }
+ 
++static u8 * eap_ttls_get_emsk(struct eap_sm *sm, void *priv, size_t *len)
++{
++        struct eap_ttls_data *data = priv;
++        u8 *key;
++
++        if (data->key_data == NULL)
++                return NULL;
++
++        key = os_malloc(EAP_EMSK_LEN);
++        if (key == NULL)
++                return NULL;
++
++        *len = EAP_EMSK_LEN;
++        os_memcpy(key, data->key_data + EAP_TLS_KEY_LEN, EAP_EMSK_LEN);
++
++        return key;
++}
++
+ 
+ int eap_peer_ttls_register(void)
+ {
+@@ -2209,6 +2227,7 @@
+ 	eap->process = eap_ttls_process;
+ 	eap->isKeyAvailable = eap_ttls_isKeyAvailable;
+ 	eap->getKey = eap_ttls_getKey;
++    eap->get_emsk = eap_ttls_get_emsk;
+ 	eap->get_status = eap_ttls_get_status;
+ 	eap->has_reauth_data = eap_ttls_has_reauth_data;
+ 	eap->deinit_for_reauth = eap_ttls_deinit_for_reauth;

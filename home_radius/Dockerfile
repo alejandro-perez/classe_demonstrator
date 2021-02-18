@@ -9,9 +9,9 @@ RUN apt-get install -y build-essential automake autoconf libtool wget libssl-dev
 # download Freeradius 3.0.3
 RUN wget ftp://ftp.freeradius.org/pub/freeradius/old/freeradius-server-3.0.3.tar.gz \
     && tar -xvf freeradius-server-3.0.3.tar.gz
-# download the patch file and apply
-RUN wget https://www.um.es/classe/files/freeradius.patch \
-    && patch -i freeradius.patch -p1
+# copy the patch file and apply
+COPY freeradius.patch .
+RUN patch -i freeradius.patch -p1
 # build and install
 WORKDIR freeradius-server-3.0.3
 RUN ./configure \
