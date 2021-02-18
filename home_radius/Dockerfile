@@ -22,7 +22,7 @@ RUN make install || make install
 COPY client.conf .
 RUN cat client.conf >> /usr/local/etc/raddb/clients.conf
 # add dictionary entry for the DSRK-Req attribute
-RUN sed -i "/SAML-AAA-Assertion/a ATTRIBUTE DSRK-Req 150 string" /usr/local/share/freeradius/dictionary.ukerna
+RUN sed -i "/SAML-AAA-Assertion/a ATTRIBUTE DSRK-Req 150 octets" /usr/local/share/freeradius/dictionary.ukerna
 # add user
 RUN echo 'test@home.org   Cleartext-Password := "testing"' >> /usr/local/etc/raddb/users
 # configure erp_realm
