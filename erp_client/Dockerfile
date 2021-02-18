@@ -29,4 +29,7 @@ RUN ln -s /usr/local/lib/gss /usr/lib/x86_64-linux-gnu/
 RUN cp mech_eap/mech /etc/gss/mech.d/moonshot.conf
 # configure the RADIUS proxy
 COPY radsec.conf /usr/local/etc
+# For simplicity, hardcode the EAP identity
+COPY credential.xml .
+RUN moonshot-webp credential.xml
 CMD while true; do gss-server -verbose a@service; done
